@@ -24,7 +24,7 @@ for subject_idx, x_path in enumerate(x_files):
     X_sub = np.load(x_path)  # Kształt: (Epoki, Kanały, Częstotliwości, Czas)
     y_sub = np.load(y_path)
     
-    # Zmieniamy układ osi pod TensorFlow
+    # Zmieniamy układ osi pod TensorFlow -> (Epoki, Częstotliwość, Czas, Kanały)
     X_sub = np.transpose(X_sub, (0, 2, 3, 1))
     y_sub = y_sub - 101
     
@@ -44,103 +44,119 @@ X = np.concatenate(all_X, axis=0)
 y = np.concatenate(all_y, axis=0)
 groups = np.concatenate(all_groups, axis=0)
 
-print(f"Dane załadowane! Kształt X dla TensorFlow: {X.shape}") # [Epoki, Częstotliwość, Czas, Kanały]
+print(f"Dane załadowane! Kształt X dla TensorFlow: {X.shape}") 
 print(f"Kształt y: {y.shape}")
 
-# 2. DEFINICJA ARCHITEKTURY SIECI CNN
-def build_cnn_model(input_shape, num_classes):
-    """Mocno zregularyzowana sieć CNN dedykowana do trudnych danych EEG."""
-    reg = tf.keras.regularizers.l2(0.001) # Kara L2 zapobiegająca przeuczeniu
+
+# 2. DEFINICJA ARCHITEKTURY EEGNet (Dostosowanej do Spektrogramów)
+def build_eegnet_model(input_shape, num_classes):
+    F1 = 8  
+    D = 2   
+    F2 = F1 * D  
+    num_channels = input_shape[2] 
     
     model = models.Sequential([
-        # Warstwa 1
-        layers.Conv2D(32, (3, 3), activation='relu', kernel_regularizer=reg, input_shape=input_shape),
+        layers.Input(shape=input_shape),
+        layers.Permute((3, 2, 1)),
+        
+        # BLOCK 1
+        layers.Conv2D(filters=F1, kernel_size=(1, 15), padding='same', use_bias=False),
         layers.BatchNormalization(),
-        layers.SpatialDropout2D(0.2), # <-- Wycinamy całe mapy cech, a nie pojedyncze piksele
-        layers.MaxPooling2D((2, 2)),
-        
-        # Warstwa 2
-        layers.Conv2D(64, (3, 3), activation='relu', kernel_regularizer=reg),
+        layers.DepthwiseConv2D(kernel_size=(num_channels, 1), padding='valid', 
+                               depth_multiplier=D, use_bias=False,
+                               depthwise_constraint=tf.keras.constraints.MaxNorm(1.0)),
         layers.BatchNormalization(),
-        layers.SpatialDropout2D(0.2),
-        layers.MaxPooling2D((2, 2)),
+        layers.Activation('elu'),
+        layers.AveragePooling2D(pool_size=(1, 4)),
+        layers.Dropout(0.25),
         
-        # Warstwa 3
-        layers.Conv2D(64, (3, 3), activation='relu', kernel_regularizer=reg),
+        # BLOCK 2
+        layers.SeparableConv2D(filters=F2, kernel_size=(1, 16), padding='same', use_bias=False),
         layers.BatchNormalization(),
+        layers.Activation('elu'),
+        layers.AveragePooling2D(pool_size=(1, 4)),
+        layers.Dropout(0.25),
         
-        layers.GlobalAveragePooling2D(), 
-        
-        # Klasyfikator z wyższym Dropoutem
-        layers.Dense(64, activation='relu', kernel_regularizer=reg),
-        layers.Dropout(0.5), # Podnosimy do 50%
-        layers.Dense(num_classes, activation='softmax')
+        # KLASYFIKATOR
+        layers.Flatten(),
+        layers.Dense(num_classes, activation='softmax', 
+                     kernel_constraint=tf.keras.constraints.MaxNorm(0.25))
     ])
     
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), # Zaczynamy wyżej, bo scheduler sam go zmniejszy
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
     return model
 
+
 # 3. PĘTLA TRENINGOWA (SUBJECT-INDEPENDENT)
-gkf = GroupKFold(n_splits=5) # Dzielimy zbiór na 5 części (całymi ludźmi)
-input_shape = (X.shape[1], X.shape[2], X.shape[3]) # (Częstotliwości, Czas, Kanały)
+gkf = GroupKFold(n_splits=5) 
+input_shape = (X.shape[1], X.shape[2], X.shape[3]) 
 
 for fold, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups)):
     print(f"\n" + "="*50)
-    print(f" TRENOWANIE FOLD {fold + 1} / 5")
+    print(f" TRENOWANIE FOLD {fold + 1} / 5 (Model: EEGNet)")
     print("="*50)
     
-    # Podział na zbiór treningowy i testowy (nowe osoby!)
+    # Podział na zbiór treningowy i testowy
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
     
-    # Normalizacja danych (Z-score) bazowana na danych treningowych
+    # Normalizacja danych (Z-score)
     mean = X_train.mean()
     std = X_train.std()
-
     X_train -= mean
     X_train /= std
-    
     X_test -= mean
     X_test /= std
     
-    # Tworzymy czysty model dla tego foldu
-    model = build_cnn_model(input_shape, NUM_CLASSES)
+    # Tworzymy czysty model
+    model = build_eegnet_model(input_shape, NUM_CLASSES)
 
-    # Definicja Early Stoppingu
+    # --- DEFINICJA CALLBACKÓW (STRAŻNIKÓW) ---
+    
+    # 1. Early Stopping - przerwie gdy model zacznie "puchnąć" z overfittingu
     early_stopping = tf.keras.callbacks.EarlyStopping(
         monitor='val_loss', 
-        patience=6,                  # Jeśli przez 8 epok val_loss nie spadnie, kończymy
-        restore_best_weights=True    # Zachowaj najlepszą wersję modelu, a nie tę zepsutą z końca
+        patience=20,                  
+        restore_best_weights=True    
     )
 
+    # 2. ReduceLROnPlateau - zmniejszy krok uczenia w trudnych momentach
     lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
         monitor='val_loss',
-        factor=0.5,       # Zmniejsz krok uczenia o połowę (np. z 0.001 na 0.0005)
-        patience=3,       # Jeśli przez 3 epoki val_loss nie spada, reaguj
+        factor=0.5,       
+        patience=3,       
         verbose=1,
         min_lr=1e-5
     )
     
-    # URUCHOMIENIE TRENINGU
-    # epochs=15 oznacza, że model przejrzy dane treningowe 15 razy. 
-    # batch_size=32 oznacza, że aktualizuje wagi sieci po każdych 32 spektrogramach.
+    # 3. NOWOŚĆ: ModelCheckpoint - automatyczny zapis najlepszych wag na dysk
+    model_filename = f"models/best_eegnet_fold_{fold + 1}.keras"
+    checkpoint = tf.keras.callbacks.ModelCheckpoint(
+        filepath=model_filename,
+        monitor='val_loss',         # Obserwujemy stratę na nowym użytkowniku
+        save_best_only=True,        # Zapisuj TYLKO wtedy, gdy pobiliśmy rekord (najniższy val_loss)
+        mode='min',                 # Interesuje nas minimalizacja straty
+        verbose=1                   # Wyświetli komunikat w konsoli, kiedy plik zostanie nadpisany
+    )
+    
+    # URUCHOMIENIE TRENINGU (Przekazujemy komplet 3 callbacków)
     history = model.fit(
         X_train, y_train, 
-        epochs=50,                  # Zwiększamy sufit do 50 epok
+        epochs=50,                  
         batch_size=32, 
         validation_data=(X_test, y_test), 
-        callbacks=[early_stopping, lr_scheduler],  # <-- Wstrzykujemy naszego strażnika
+        callbacks=[early_stopping, lr_scheduler, checkpoint],  # <-- Dodany checkpoint
         verbose=1
     )
     
-    # Ewaluacja na osobach odłożonych do testu
+    # Ewaluacja na osobach odłożonych do testu (wykorzystuje przywrócone najlepsze wagi)
     test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
     print(f"\n-> Wynik FOLD {fold + 1}: Celność na NIEZNANYCH użytkownikach = {test_acc*100:.2f}%")
+    print(f"[INFO] Najlepsza wersja tego modelu jest bezpieczna w pliku: {model_filename}")
     
-    # Zatrzymujemy pętlę po pierwszym foldzie na próbę, żebyś zobaczył czy działa
     print("\n[INFO] Próba udana. Jeśli chcesz przetestować wszystkie foldy, usuń instrukcję 'break'.")
-    break
+    #break
